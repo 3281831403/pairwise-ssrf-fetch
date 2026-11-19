@@ -17,6 +17,18 @@ Canonical policy keys (all optional, defaults shown)::
     }
 """
 
+import ipaddress
+import time
+from urllib.parse import urlsplit
+
+_DEFAULT_SCHEMES = {"http", "https"}
+_DEFAULT_PORTS = {80, 443}
+_DEFAULT_MAX_REDIRECTS = 5
+_DEFAULT_TIMEOUT = 5.0
+_DEFAULT_MAX_BYTES = 1048576
+
+_DEFAULT_PORT_BY_SCHEME = {"http": 80, "https": 443}
+
 
 class BlockedURL(Exception):
     """Raised when a URL, address, redirect, response, or deadline is unsafe."""
@@ -48,7 +60,54 @@ def parse_url(url: str, policy: dict) -> dict:
     Raises ``BlockedURL`` for every policy violation or malformed URL.
     """
 
-    raise NotImplementedError
+    schemes = policy.get("schemes", _DEFAULT_SCHEMES)
+    allowed_ports = policy.get("allowed_ports", _DEFAULT_PORTS)
+
+    try:
+        parts = urlsplit(url)
+    except (ValueError, TypeError) as exc:
+        raise BlockedURL(f"malformed URL: {url!r}") from exc
+
+    scheme = parts.scheme.lower()
+    if not scheme or scheme not in schemes:
+        raise BlockedURL(f"scheme not allowed: {parts.scheme!r}")
+
+    try:
+        if parts.username is not None or parts.password is not None:
+            raise BlockedURL("userinfo is not allowed")
+        host = parts.hostname
+        port = parts.port
+    except ValueError as exc:
+        raise BlockedURL(f"malformed URL: {url!r}") from exc
+
+    if not host:
+        raise BlockedURL("missing host")
+
+    host = host.lower()
+    try:
+        host.encode("ascii")
+    except UnicodeEncodeError:
+        try:
+            host = host.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError) as exc:
+            raise BlockedURL(f"unparseable host: {host!r}") from exc
+    if not host:
+        raise BlockedURL("missing host")
+
+    if port is None:
+        port = _DEFAULT_PORT_BY_SCHEME.get(scheme)
+        if port is None:
+            raise BlockedURL(f"no default port for scheme {scheme!r}")
+    if port not in allowed_ports:
+        raise BlockedURL(f"port not allowed: {port}")
+
+    return {
+        "scheme": scheme,
+        "host": host,
+        "port": port,
+        "path": parts.path,
+        "query": parts.query,
+    }
 
 
 def check_ip(ip: str, policy: dict) -> None:
@@ -70,7 +129,29 @@ def check_ip(ip: str, policy: dict) -> None:
         address raises ``BlockedURL``.
     """
 
-    raise NotImplementedError
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError as exc:
+        raise BlockedURL(f"non-canonical or malformed IP address: {ip!r}") from exc
+
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        raise BlockedURL(f"IPv4-mapped IPv6 address is not allowed: {ip!r}")
+
+    if (
+        address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    ):
+        raise BlockedURL(f"address is not a public unicast address: {ip!r}")
+
+    for network in policy.get("blocked_networks", ()):
+        if isinstance(network, str):
+            network = ipaddress.ip_network(network, strict=False)
+        if address in network:
+            raise BlockedURL(f"address is inside a blocked network: {ip!r}")
 
 
 def validate_redirect(from_url: str, to_url: str, policy: dict) -> None:
@@ -96,7 +177,62 @@ def validate_redirect(from_url: str, to_url: str, policy: dict) -> None:
     this function succeeds.
     """
 
-    raise NotImplementedError
+    max_redirects = policy.get("max_redirects", _DEFAULT_MAX_REDIRECTS)
+    redirects_followed = policy.get("redirects_followed", 0)
+    if redirects_followed >= max_redirects:
+        raise BlockedURL("redirect limit exceeded")
+
+    source = parse_url(from_url, policy)
+    target = parse_url(to_url, policy)
+
+    if source["scheme"] != target["scheme"]:
+        if source["scheme"] == "http" and target["scheme"] == "https":
+            pass  # upgrade is allowed
+        else:
+            raise BlockedURL(
+                f"scheme change not allowed: {source['scheme']} -> {target['scheme']}"
+            )
+
+    try:
+        ipaddress.ip_address(target["host"])
+    except ValueError:
+        return  # hostname target: caller resolves and validates next
+    check_ip(target["host"], policy)
+
+
+def _header_get(headers, name):
+    for key, value in headers.items():
+        if key.lower() == name:
+            return value
+    return None
+
+
+def _read_body(body, max_bytes, deadline):
+    """Read ``body`` enforcing the byte cap and the deadline while reading."""
+    if isinstance(body, (bytes, bytearray)):
+        data = bytes(body)
+        if len(data) > max_bytes:
+            raise BlockedURL("response body exceeds byte limit")
+        return data
+
+    chunks = []
+    total = 0
+    try:
+        while True:
+            if time.monotonic() > deadline:
+                raise BlockedURL("deadline exhausted while reading body")
+            chunk = body.read(min(65536, max_bytes - total + 1))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise BlockedURL("response body exceeds byte limit")
+    finally:
+        close = getattr(body, "close", None)
+        if callable(close):
+            close()
+    return b"".join(chunks)
 
 
 def fetch(
@@ -150,7 +286,52 @@ def fetch(
     policy, resolution, redirect, size, or deadline violation.
     """
 
-    raise NotImplementedError
+    timeout = policy.get("timeout", _DEFAULT_TIMEOUT)
+    deadline = time.monotonic() + timeout
+
+    current_url = url
+    redirects_followed = 0
+
+    while True:
+        parsed = parse_url(current_url, policy)
+
+        addresses = resolver(parsed["host"])
+        if not addresses:
+            raise BlockedURL(f"empty DNS answer for {parsed['host']!r}")
+        for address in addresses:
+            check_ip(address, policy)
+        chosen = addresses[0]
+
+        host_literal = f"[{chosen}]" if ":" in chosen else chosen
+        pinned_url = f"{parsed['scheme']}://{host_literal}:{parsed['port']}{parsed['path']}"
+        if parsed["query"]:
+            pinned_url += f"?{parsed['query']}"
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BlockedURL("deadline exhausted before opening connection")
+
+        status, headers, body = opener(pinned_url, remaining)
+
+        if 200 <= status < 300:
+            return _read_body(body, max_bytes, deadline)
+
+        close = getattr(body, "close", None)
+        if callable(close):
+            close()
+
+        if 300 <= status < 400:
+            location = _header_get(headers, "location")
+            if not location:
+                raise BlockedURL("redirect without Location header")
+            hop_policy = dict(policy)
+            hop_policy["redirects_followed"] = redirects_followed
+            validate_redirect(current_url, location, hop_policy)
+            redirects_followed += 1
+            current_url = location
+            continue
+
+        raise BlockedURL(f"unexpected response status: {status}")
 
 
 def fetch_many(
@@ -174,4 +355,8 @@ def fetch_many(
       * No network I/O except through the injected callables.
     """
 
-    raise NotImplementedError
+    max_bytes = policy.get("max_bytes", _DEFAULT_MAX_BYTES)
+    results = []
+    for url in urls:
+        results.append(fetch(url, policy, resolver, opener, max_bytes=max_bytes))
+    return results
